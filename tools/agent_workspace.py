@@ -24,7 +24,7 @@ WT_ROOT = MAIN.parent / "FlatOut-wt"
 
 
 def run(*cmd, cwd=MAIN):
-    r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, errors="replace")
     if r.returncode:
         sys.exit(f"error: {' '.join(cmd)}\n{r.stderr.strip()}")
     return r.stdout.strip()
@@ -39,7 +39,8 @@ def link_extracted(dest: Path):
     if link.exists():
         return
     if os.name == "nt":   # junction: no pide permisos de administrador
-        r = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(src)], capture_output=True, text=True)
+        r = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(src)], capture_output=True, text=True,
+                           errors="replace")   # la consola de Windows no usa utf-8
         if r.returncode:
             sys.exit(f"no se pudo crear el enlace: {r.stderr.strip() or r.stdout.strip()}")
     else:
