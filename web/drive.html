@@ -23,6 +23,11 @@
   #help { position:absolute; left:16px; bottom:16px; padding:10px 14px; background:var(--panel);
     border:1px solid var(--line); border-radius:10px; color:var(--muted); font-size:12px; line-height:1.6; }
   #help b { color:var(--fg); font-weight:600; }
+  #race { position:absolute; top:16px; left:50%; transform:translateX(-50%); text-align:center; font-size:15px;
+    font-variant-numeric:tabular-nums; text-shadow:0 2px 8px #000; pointer-events:none; line-height:1.5; }
+  #race:empty { display:none; }
+  #raceflash { position:absolute; top:100px; left:50%; transform:translateX(-50%); font-size:26px; font-weight:700;
+    color:var(--accent); text-shadow:0 2px 10px #000; pointer-events:none; white-space:nowrap; }
   #tuning { position:absolute; top:16px; right:16px; width:290px; padding:12px 14px; background:var(--panel);
     border:1px solid var(--line); border-radius:10px; font-size:12px; }
   #tuning[hidden] { display:none; }
@@ -42,6 +47,8 @@
   <div id="rpmbar"><div id="rpmfill"></div></div>
   <div id="nitrobar"><div id="nitrofill"></div></div>
 </div>
+<div id="race"></div>
+<div id="raceflash"></div>
 <div id="tuning" hidden>
   <b>Ajustes de conducción</b> <small>(T para ocultar)</small>
   <label>Agarre <input type="range" data-k="grip" min="0.6" max="3" step="0.05"><output></output></label>
@@ -197,6 +204,8 @@ world.timestep = DT;
 let spawn = { position: new THREE.Vector3(0, 0.5, 0), yaw: 0 };
 let surfaceAt = null;        // (hit) => {dyn} dinamica de neumatico del suelo bajo la rueda; null = asfalto en todas partes
 let tireDyn = null;          // web/data/tire_dynamics.json (tools/export_surfaces.py)
+let splitsData = null;       // puntos de control de la pista (track.json "splits")
+let race = null;             // vueltas y puntos de control (clase Race)
 let props = null;            // props dinamicos de la pista (web/props.js), si existe tracks/<pista>/props.json
 let propTick = 0;
 const dynamicTrackMeshes = [];
@@ -258,6 +267,7 @@ async function addTrack(name) {
     const s = json.start[0];
     spawn = { position: new THREE.Vector3(...s.position), yaw: s.yaw || 0 };
   }
+  splitsData = json.splits || null;
   // agarre por superficie: si la colision trae un material por triangulo (cdb2), el coche lo consulta
   if (perMaterial) {
     // Un colisionador por material de colision: cada uno con la friccion de carroceria de su superficie
@@ -354,6 +364,7 @@ function resetCar() {
   V.rb.setLinvel({ x: 0, y: 0, z: 0 }, true);
   V.rb.setAngvel({ x: 0, y: 0, z: 0 }, true);
   V.vehicle.reset();
+  if (race) race.reset();   // volver a la parrilla reinicia la carrera
 }
 
 function readInput() {
@@ -369,6 +380,7 @@ function readInput() {
 function stepPhysics() {
   V.vehicle.update(DT, readInput());
   world.step();
+  if (race) race.update(DT, V.rb.translation());
   if (props && ++propTick % 6 === 0) props.update(V.rb.translation());   // alta/baja de cuerpos y matrices de instancia (20 Hz)
 }
 
@@ -413,6 +425,110 @@ function setupTuning(veh) {
   refresh();
 }
 
+// ================= carrera: vueltas y puntos de control =================
+// Los "splits" de la pista son puertas (extremo izquierdo y derecho) en orden de circuito. Se cuenta el
+// cruce de la puerta ESPERADA (el circuito es un 8 que se cruza consigo mismo, asi que el orden manda).
+// La puerta 0 es la linea de meta: la parrilla de salida esta detras de la ultima puerta, asi que antes
+// de empezar se acepta pasar la ultima y despues la 0 arranca el cronometro.
+const TOTAL_LAPS = 3;
+const fmtTime = t => {
+  const m = Math.floor(t / 60), s = t - m * 60;
+  return `${m}:${s.toFixed(3).padStart(6, '0')}`;
+};
+const segCross = (p, q, a, b) => {   // intersecan los segmentos pq y ab (plano XZ)
+  const o = (u, v, w) => (v.x - u.x) * (w.y - u.y) - (v.y - u.y) * (w.x - u.x);
+  return o(p, q, a) * o(p, q, b) < 0 && o(a, b, p) * o(a, b, q) < 0;
+};
+
+class Race {
+  constructor(splits) {
+    this.n = splits.length;
+    this.gates = splits.map(s => ({ index: s.index, a: new THREE.Vector2(s.left[0], s.left[2]), b: new THREE.Vector2(s.right[0], s.right[2]),
+      ay: s.left[1], by: s.right[1] }));
+    this.best = null; this.bestSplits = null; this.last = null;
+    // marcador de la puerta esperada: dos postes y un plano translucido
+    const poleGeo = new THREE.CylinderGeometry(0.3, 0.3, 7, 8);
+    this.mat = new THREE.MeshBasicMaterial({ color: 0x38d6ff });
+    this.poles = [new THREE.Mesh(poleGeo, this.mat), new THREE.Mesh(poleGeo, this.mat)];
+    this.plane = new THREE.Mesh(new THREE.BufferGeometry(),
+      new THREE.MeshBasicMaterial({ color: 0x38d6ff, transparent: true, opacity: 0.12, side: THREE.DoubleSide, depthWrite: false }));
+    this.plane.geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(18), 3));
+    this.group = new THREE.Group();
+    this.group.add(...this.poles, this.plane);
+    scene.add(this.group);
+    this.reset();
+  }
+
+  reset() {
+    this.expected = this.n - 1;   // antes de salir: la ultima puerta, que queda justo delante de la parrilla
+    this.started = false; this.finished = false;
+    this.lap = 0; this.time = 0; this.lapStart = 0; this.lapSplits = []; this.lapTimes = [];
+    this.prev = null; this.flashText = ''; this.flashUntil = 0;
+    this._marker();
+  }
+
+  _marker() {
+    this.group.visible = this.expected !== null;
+    if (this.expected === null) return;
+    const g = this.gates[this.expected], finish = this.started && this.expected === 0;
+    const color = finish ? 0xff8a1f : 0x38d6ff;
+    this.mat.color.setHex(color); this.plane.material.color.setHex(color);
+    this.poles[0].position.set(g.a.x, g.ay + 3.5, g.a.y); this.poles[1].position.set(g.b.x, g.by + 3.5, g.b.y);
+    const v = this.plane.geometry.attributes.position.array, H = 6;
+    [[g.a.x, g.ay, g.a.y], [g.b.x, g.by, g.b.y], [g.b.x, g.by + H, g.b.y], [g.a.x, g.ay, g.a.y], [g.b.x, g.by + H, g.b.y], [g.a.x, g.ay + H, g.a.y]]
+      .forEach((p, i) => v.set(p, i * 3));
+    this.plane.geometry.attributes.position.needsUpdate = true;
+    this.plane.geometry.computeBoundingSphere();
+  }
+
+  flash(text, seconds = 3) { this.flashText = text; this.flashUntil = this.time + seconds; }
+
+  update(dt, p) {
+    this.time += dt;
+    const cur = new THREE.Vector2(p.x, p.z);
+    if (this.prev && this.expected !== null) {
+      const g = this.gates[this.expected];
+      if (segCross(this.prev, cur, g.a, g.b)) this._cross(g);
+    }
+    this.prev = cur;
+  }
+
+  _cross(g) {
+    const i = g.index, lapTime = this.time - this.lapStart;
+    if (!this.started && i === this.n - 1) {
+      this.expected = 0;                                  // pasa la ultima puerta antes de la linea de meta
+    } else if (i === 0) {
+      if (!this.started) {
+        this.started = true; this.lap = 1; this.lapStart = this.time; this.expected = 1;
+        this.flash('¡Vuelta 1!');
+      } else {
+        this.lapTimes.push(lapTime); this.last = lapTime;
+        const isBest = this.best === null || lapTime < this.best;
+        if (isBest) { this.best = lapTime; this.bestSplits = this.lapSplits.slice(); }
+        this.flash(`Vuelta ${this.lap}: ${fmtTime(lapTime)}${isBest ? ' · ¡mejor!' : ''}`, 4);
+        this.lapSplits = [];
+        if (this.lap >= TOTAL_LAPS) {
+          this.finished = true; this.expected = null;
+          this.flash(`¡Carrera terminada! ${fmtTime(this.lapTimes.reduce((a, b) => a + b, 0))}`, 8);
+        } else { this.lap++; this.lapStart = this.time; this.expected = 1; }
+      }
+    } else {                                              // punto de control 1..n-1
+      this.lapSplits[i] = lapTime;
+      const ref = this.bestSplits && this.bestSplits[i];
+      this.flash(`Punto ${i}: ${fmtTime(lapTime)}${ref ? `  (${lapTime - ref >= 0 ? '+' : '-'}${Math.abs(lapTime - ref).toFixed(2)})` : ''}`, 2.5);
+      this.expected = (i + 1) % this.n;
+    }
+    this._marker();
+  }
+
+  hud() {
+    const cur = this.started && !this.finished ? this.time - this.lapStart : (this.finished ? this.lapTimes[this.lapTimes.length - 1] : 0);
+    return `<b>Vuelta ${Math.max(this.lap, 0)}/${TOTAL_LAPS}</b> &nbsp; ${fmtTime(cur)}<br>` +
+      `Mejor ${this.best === null ? '--' : fmtTime(this.best)} &nbsp; Última ${this.last === null ? '--' : fmtTime(this.last)}<br>` +
+      (this.expected === null ? 'Meta' : `Punto ${this.started ? this.expected : 0}/${this.n - 1}`);
+  }
+}
+
 // ================= arranque =================
 try {
   msg('Cargando coche y pista…');
@@ -425,6 +541,7 @@ try {
   V.vehicle.surfaceAt = surfaceAt;
   V.vehicle.defaultDyn = tireDyn.Tarmac;
   setupTuning(V.vehicle);
+  if (splitsData && splitsData.length > 2) { race = new Race(splitsData); race.reset(); }
   if (TRACK) {   // props dinamicos (vallas, barriles, neumaticos...): opcionales
     try {
       const { loadProps } = await import(`./props.js?t=${Date.now()}`);
@@ -459,11 +576,15 @@ renderer.setAnimationLoop(now => {
   $('rpmfill').style.width = `${Math.min(100, veh.rpm / veh.red * 100)}%`;
   $('nitrofill').style.width = `${veh.nitroMax ? veh.nitro / veh.nitroMax * 100 : 0}%`;
   $('nitrobar').classList.toggle('on', veh.nitroActive);
+  if (race) {
+    $('race').innerHTML = race.hud();
+    $('raceflash').textContent = race.time < race.flashUntil ? race.flashText : '';
+  }
   renderer.render(scene, camera);
 });
 
 // para depurar y probar desde la consola
-window.game = { THREE, scene, camera, world, DT, get V() { return V; }, get props() { return props; }, keys,
+window.game = { THREE, scene, camera, world, DT, get V() { return V; }, get props() { return props; }, get race() { return race; }, keys,
   // avanza la física N segundos de golpe, sin depender de la tasa de fotogramas (para tests)
   simulate(seconds) { for (let n = Math.round(seconds / DT); n > 0; n--) stepPhysics(); syncVisual(); },
   state() {
