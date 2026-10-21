@@ -1,0 +1,5 @@
+# Datos del juego extraidos y activos generados: no son codigo del proyecto
+extracted/
+web/cars/
+web/tracks/
+*.log

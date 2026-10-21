@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FlatOut UC - Test de props</title>
+<style>
+  html, body { margin:0; height:100%; background:#14161a; color:#e8eaed; font:13px/1.4 system-ui, sans-serif; overflow:hidden; }
+  canvas { display:block; }
+  #info { position:absolute; left:12px; top:12px; padding:8px 12px; background:#1d2026e6; border:1px solid #2f333b;
+    border-radius:10px; white-space:pre; font:12px/1.5 ui-monospace, Consolas, monospace; }
+</style>
+</head>
+<body>
+<div id="info">Cargando…</div>
+<script>
+  // muestra errores de carga del modulo (un fallo en un import top-level seria silencioso)
+  addEventListener('error', e => { document.getElementById('info').textContent = 'ERROR: ' + e.message; });
+  addEventListener('unhandledrejection', e => { document.getElementById('info').textContent = 'ERROR: ' + (e.reason && e.reason.message || e.reason); });
+</script>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+  "rapier": "https://cdn.jsdelivr.net/npm/@dimforge/rapier3d-compat@0.14.0/rapier.es.js"
+} }
+</script>
+<script type="module">
+// Coche proxy (caja dinamica de 1300 kg) lanzado contra los props de arena1.
+//   ?track=track.json  -> usa la pista con los props fusionados (comparar el render; sin props.js)
+//   ?noprops=1         -> no carga props.js
+// Consola: t.shoot(x, z, vkmh) lanza el proxy contra (x,z); t.simulate(s) avanza la fisica; t.stats().
+import * as THREE from 'three';
+import { DDSLoader } from 'three/addons/loaders/DDSLoader.js';
+import RAPIER from 'rapier';
+const { loadProps } = await import(`./props.js?t=${Date.now()}`);
+
+const params = new URLSearchParams(location.search);
+const TRACK_JSON = params.get('track') || 'track.noprops.json';
+const $info = document.getElementById('info');
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+document.body.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x8fb4d9);
+const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.1, 1500);
+scene.add(new THREE.HemisphereLight(0xdfeaff, 0x6a6558, 1.4));
+const sun = new THREE.DirectionalLight(0xfff2dd, 2.4); sun.position.set(60, 100, -40); scene.add(sun);
+
+await RAPIER.init();
+const DT = 1 / 120;
+const world = new RAPIER.World({ x: 0, y: -9.81, z: 0 });
+world.timestep = DT;
+
+// ---- pista (render + trimesh), igual que drive.html ----
+const ddsLoader = new DDSLoader();
+const texCache = new Map();
+const loadTexture = (dirs, file) => {
+  const key = dirs.join('|') + file;
+  if (!texCache.has(key)) texCache.set(key, new Promise(resolve => {
+    const next = i => i >= dirs.length ? resolve(null) : ddsLoader.load(dirs[i] + file, t => {
+      t.wrapS = t.wrapT = THREE.RepeatWrapping; t.colorSpace = THREE.SRGBColorSpace; resolve(t);
+    }, undefined, () => next(i + 1));
+    next(0);
+  }));
+  return texCache.get(key);
+};
+const [json, bin] = await Promise.all([
+  fetch(`tracks/arena1/${TRACK_JSON}`).then(r => r.json()),
+  fetch('tracks/arena1/track.bin').then(r => r.arrayBuffer()),
+]);
+const mats = await Promise.all(json.materials.map(async m => {
+  const map = m.texture ? await loadTexture(json.textureDirs, m.texture) : null;
+  const mat = new THREE.MeshStandardMaterial({ map, roughness: 0.6, metalness: 0.1, color: map ? 0xffffff : 0x555555 });
+  if (m.shader === 6) Object.assign(mat, { transparent: true, opacity: 0.55, depthWrite: false });
+  else if (m.shader === 10) Object.assign(mat, { transparent: true, depthWrite: false });
+  else if (m.alpha) Object.assign(mat, { transparent: true, alphaTest: 0.4, side: THREE.DoubleSide });
+  return mat;
+}));
+const A = (r, T, n) => new THREE.BufferAttribute(new T(bin, r.offset, r.count), n);
+for (const p of json.primitives) {
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', A(p.position, Float32Array, 3));
+  if (p.normal) g.setAttribute('normal', A(p.normal, Float32Array, 3)); else g.computeVertexNormals();
+  if (p.uv) g.setAttribute('uv', A(p.uv, Float32Array, 2));
+  g.setIndex(A(p.index, Uint16Array, 1));
+  scene.add(new THREE.Mesh(g, mats[p.material]));
+}
+const c = json.collision;
+world.createCollider(RAPIER.ColliderDesc.trimesh(
+  new Float32Array(bin.slice(c.position.offset, c.position.offset + c.position.count * 4)),
+  new Uint32Array(bin.slice(c.index.offset, c.index.offset + c.index.count * 4))).setFriction(1));
+
+// ---- coche proxy: caja 1300 kg, grupos del coche (membresia 1, filtro 1|4) ----
+const proxyRb = world.createRigidBody(RAPIER.RigidBodyDesc.dynamic().setCcdEnabled(true).setCanSleep(false)
+  .setTranslation(json.start[0].position[0], json.start[0].position[1] + 1, json.start[0].position[2]));
+world.createCollider(RAPIER.ColliderDesc.cuboid(0.9, 0.45, 2.0).setDensity(1300 / (1.8 * 0.9 * 4))
+  .setFriction(0.35).setRestitution(0.12).setCollisionGroups(0x00010005), proxyRb);
+const proxyMesh = new THREE.Mesh(new THREE.BoxGeometry(1.8, 0.9, 4), new THREE.MeshStandardMaterial({ color: 0xff8a1f }));
+scene.add(proxyMesh);
+
+const props = params.get('noprops') || TRACK_JSON === 'track.json'
+  ? null : await loadProps(RAPIER, world, scene, 'tracks/arena1/props.json');
+
+const pos = () => { const t = proxyRb.translation(); return new THREE.Vector3(t.x, t.y, t.z); };
+// 'hold': el proxy no tiene motor; mientras hold esta activo se mantiene su velocidad horizontal (como un coche acelerando)
+let hold = null;
+function step() {
+  if (hold) { const l = proxyRb.linvel(); proxyRb.setLinvel({ x: hold.x, y: l.y, z: hold.z }, true); }
+  if (props) props.update(pos());
+  world.step();
+}
+function sync() {
+  const t = proxyRb.translation(), r = proxyRb.rotation();
+  proxyMesh.position.set(t.x, t.y, t.z); proxyMesh.quaternion.set(r.x, r.y, r.z, r.w);
+}
+
+// lanza el proxy contra (x, z) desde 25 m, a vkmh, siguiendo el suelo por un rayo
+function shoot(x, z, vkmh = 60, from = 25, angle = 0, keep = true) {
+  const dir = new THREE.Vector3(Math.sin(angle), 0, Math.cos(angle));      // direccion de aproximacion
+  const sx = x - dir.x * from, sz = z - dir.z * from;
+  const ray = new RAPIER.Ray({ x: sx, y: 60, z: sz }, { x: 0, y: -1, z: 0 });
+  const hit = world.castRay(ray, 100, true, undefined, 0xFFFF0001, undefined, proxyRb);   // solo suelo (filtro 1: ni props ni el proxy)
+  const y = (hit ? 60 - hit.timeOfImpact : 5) + 0.8;
+  const q = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), Math.atan2(-dir.x, -dir.z));
+  proxyRb.setTranslation({ x: sx, y, z: sz }, true);
+  proxyRb.setRotation({ x: q.x, y: q.y, z: q.z, w: q.w }, true);
+  const v = vkmh / 3.6;
+  proxyRb.setLinvel({ x: dir.x * v, y: 0, z: dir.z * v }, true);
+  proxyRb.setAngvel({ x: 0, y: 0, z: 0 }, true);
+  hold = keep ? { x: dir.x * v, z: dir.z * v } : null;
+  sync();
+  return { y };
+}
+
+function simulate(seconds) { for (let n = Math.round(seconds / DT); n > 0; n--) step(); sync(); }
+
+// mide el coste de world.step() (ms) durante `seconds` de simulacion
+function bench(seconds = 2) {
+  const times = [];
+  for (let n = Math.round(seconds / DT); n > 0; n--) {
+    if (props) props.update(pos());
+    const t0 = performance.now(); world.step(); times.push(performance.now() - t0);
+  }
+  sync();
+  times.sort((a, b) => a - b);
+  return { steps: times.length, mean: +(times.reduce((a, b) => a + b, 0) / times.length).toFixed(3),
+    p95: +times[Math.floor(times.length * 0.95)].toFixed(3), max: +times[times.length - 1].toFixed(3) };
+}
+
+function stats() {
+  const p = pos();
+  return { proxy: [p.x, p.y, p.z].map(v => +v.toFixed(1)), speed: +(Math.hypot(proxyRb.linvel().x, proxyRb.linvel().z) * 3.6).toFixed(1),
+    props: props && props.counts, created: props && props.stats.created, awake: props && props.stats.awake,
+    bodiesInWorld: world.bodies.len() };
+}
+
+const first = json.start[0];
+camera.position.set(first.position[0], first.position[1] + 6, first.position[2] + 10);
+camera.lookAt(first.position[0], first.position[1], first.position[2]);
+sync();
+if (props) props.update(pos());
+
+const camTarget = { set: false };
+window.t = { setHold(h) { hold = h; }, THREE, scene, camera, world, props, proxyRb, shoot, simulate, bench, stats, DT,
+  look(x, y, z, dx = 8, dy = 5, dz = 8) { camera.position.set(x + dx, y + dy, z + dz); camera.lookAt(x, y, z); camTarget.set = true; } };
+
+$info.textContent = `track ${TRACK_JSON} · ${props ? `${props.count} props, ${props.counts.models} modelos` : 'sin props.js'}`;
+renderer.setAnimationLoop(() => {
+  if (params.get('run')) { step(); sync(); }
+  renderer.render(scene, camera);
+});
+</script>
+</body>
+</html>

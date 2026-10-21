@@ -1,0 +1,19 @@
+<!doctype html><html><head><meta charset="utf-8"><title>cmap probe</title>
+<style>body{margin:0;background:#333;color:#ddd;font:12px monospace}img,canvas{width:48vw;margin:4px;image-rendering:auto}</style>
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}</script></head>
+<body><div id="o"></div><script type="module">
+import * as THREE from 'three';
+import { DDSLoader } from 'three/addons/loaders/DDSLoader.js';
+const L = new DDSLoader();
+const base = '../extracted/data/tracks/arena/arena1/a/lighting/';
+// vuelca cada mapa DDS a un canvas 2D (via un render WebGL -> canvas)
+const r = new THREE.WebGLRenderer({ preserveDrawingBuffer: true }); r.setSize(512, 512);
+const sc = new THREE.Scene(), cam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+for (const f of ['colormap1_w2', 'lightmap1_w2', 'occlusionmap1_w2', 'externalmap1_w2']) {
+  const t = await new Promise(res => L.load(base + f + '.dds', res));
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), new THREE.MeshBasicMaterial({ map: t }));
+  sc.clear(); sc.add(m); r.render(sc, cam);
+  const im = new Image(); im.src = r.domElement.toDataURL(); im.title = f; document.getElementById('o').append(im);
+}
+document.title = 'ready';
+</script></body></html>

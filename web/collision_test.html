@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="es"><head><meta charset="utf-8"><title>Collision test</title>
+<style>html,body{margin:0;height:100%;background:#222;color:#ddd;font:12px monospace}
+#info{position:fixed;left:6px;top:6px;background:#000a;padding:4px 6px;white-space:pre;max-width:46vw}
+#leg{position:fixed;right:6px;top:6px;background:#000a;padding:4px 6px}
+#leg i{display:inline-block;width:10px;height:10px;margin-right:5px}</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script></head><body><div id="info">cargando...</div><div id="leg"></div>
+<script type="module">
+// Visualiza la colision de web/tracks/arena1 coloreada por material.
+// ?src=fallback  -> colision antigua (sin materiales, gris); ?cam=top|side ; ?wire=1 superpone el fallback
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+const Q = new URLSearchParams(location.search);
+const BASE = 'tracks/arena1/';
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x20252b);
+const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.5, 4000);
+const controls = new OrbitControls(camera, renderer.domElement);
+scene.add(new THREE.HemisphereLight(0xffffff, 0x555555, 1.5));
+const sun = new THREE.DirectionalLight(0xffffff, 1.4); sun.position.set(1, 2, 0.6); scene.add(sun);
+
+const [json, bin] = await Promise.all([
+  fetch(BASE + 'track.json').then(r => r.json()),
+  fetch(BASE + 'track.bin').then(r => r.arrayBuffer())]);
+const useFallback = Q.get('src') === 'fallback';
+const col = useFallback ? json.collisionFallback : json.collision;
+const pos = new Float32Array(bin, col.position.offset, col.position.count);
+const idx = new Uint32Array(bin, col.index.offset, col.index.count);
+const nTri = idx.length / 3;
+const tmat = col.triMaterial ? new Uint8Array(bin, col.triMaterial.offset, col.triMaterial.count) : null;
+
+// paleta por material (un color por id); gris si no hay materiales
+const palette = [0xd9a441, 0x4fa3d9, 0xe0584a, 0x6cc070, 0xb779d6, 0xe8e05a, 0x4ad9c4, 0xff8fb0, 0x9a9a9a, 0xa0663c];
+const colorOf = m => new THREE.Color(tmat ? palette[m % palette.length] : 0x889099);
+
+// geometria no indexada para poder dar un color por triangulo
+const P = new Float32Array(nTri * 9), C = new Float32Array(nTri * 9);
+const count = {};
+for (let t = 0; t < nTri; t++) {
+  const m = tmat ? tmat[t] : 0; count[m] = (count[m] || 0) + 1;
+  const c = colorOf(m);
+  for (let k = 0; k < 3; k++) {
+    const v = idx[t * 3 + k] * 3;
+    P.set([pos[v], pos[v + 1], pos[v + 2]], t * 9 + k * 3);
+    C.set([c.r, c.g, c.b], t * 9 + k * 3);
+  }
+}
+const g = new THREE.BufferGeometry();
+g.setAttribute('position', new THREE.BufferAttribute(P, 3));
+g.setAttribute('color', new THREE.BufferAttribute(C, 3));
+g.computeVertexNormals();
+const mesh = new THREE.Mesh(g, new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide }));
+scene.add(mesh);
+g.computeBoundingBox();
+
+if (Q.get('wire') && json.collisionFallback && !useFallback) {
+  const f = json.collisionFallback;
+  const fg = new THREE.BufferGeometry();
+  fg.setAttribute('position', new THREE.BufferAttribute(new Float32Array(bin, f.position.offset, f.position.count), 3));
+  fg.setIndex(new THREE.BufferAttribute(new Uint32Array(bin, f.index.offset, f.index.count), 1));
+  scene.add(new THREE.Mesh(fg, new THREE.MeshBasicMaterial({ color: 0xffffff, wireframe: true, transparent: true, opacity: 0.08 })));
+}
+
+// start points (esferas verdes) y splits (lineas izquierda-derecha, rojo)
+for (const s of json.start || []) {
+  const m = new THREE.Mesh(new THREE.SphereGeometry(1.2), new THREE.MeshBasicMaterial({ color: 0x00ff66 }));
+  m.position.set(...s.position); scene.add(m);
+}
+for (const s of json.splits || []) {
+  const l = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(...s.left), new THREE.Vector3(...s.right)]),
+    new THREE.LineBasicMaterial({ color: 0xff2222 }));
+  scene.add(l);
+}
+
+const bb = g.boundingBox, ctr = bb.getCenter(new THREE.Vector3()), sz = bb.getSize(new THREE.Vector3());
+controls.target.copy(ctr);
+if (Q.get('cam') === 'side') camera.position.set(ctr.x, ctr.y + 60, ctr.z + sz.z * 0.9);
+else camera.position.set(ctr.x, ctr.y + Math.max(sz.x, sz.z) * 0.95, ctr.z + 1);
+controls.update();
+
+const leg = document.getElementById('leg');
+leg.innerHTML = Object.keys(count).map(m => {
+  const mat = col.materials ? col.materials[m] : { name: 'fallback (sin material)', grip: '-' };
+  return `<div><i style="background:#${colorOf(+m).getHexString()}"></i>${mat.name} grip=${mat.grip} : ${count[m]}</div>`;
+}).join('');
+document.getElementById('info').textContent =
+  `${useFallback ? 'FALLBACK' : 'CDB2'} ${nTri} triangulos, ${pos.length / 3} vertices\n` +
+  `bbox ${bb.min.toArray().map(v => v.toFixed(0))} .. ${bb.max.toArray().map(v => v.toFixed(0))}\n` +
+  `starts ${(json.start || []).length}  splits ${(json.splits || []).length}`;
+window.__collision = { nTri, count, materials: col.materials, bbox: [bb.min.toArray(), bb.max.toArray()] };
+
+addEventListener('resize', () => { renderer.setSize(innerWidth, innerHeight); camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); });
+renderer.setAnimationLoop(() => { controls.update(); renderer.render(scene, camera); });
+</script></body></html>

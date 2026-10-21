@@ -1,0 +1,18 @@
+# Datos del juego (copia propia de Steam): no se versionan ni se publican
+extracted/
+
+# Todo lo que sale de los archivos del juego se regenera con tools/*.py
+web/cars/
+web/tracks/
+web/data/
+web/dynamic_objects.json
+web/surface_dynamics.json
+
+# Registros, salidas de herramientas y dependencias locales
+*.log
+graphify-out/
+__pycache__/
+*.pyc
+.venv/
+node_modules/
+*.bak

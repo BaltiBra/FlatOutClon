@@ -1,0 +1,481 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FlatOut UC - Conducir</title>
+<style>
+  :root { --bg:#14161a; --panel:#1d2026e6; --fg:#e8eaed; --muted:#9aa0a6; --accent:#ff8a1f; --line:#2f333b; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--fg);
+    font:14px/1.4 system-ui, Segoe UI, sans-serif; overflow:hidden; }
+  canvas { display:block; }
+  #hud { position:absolute; right:24px; bottom:24px; text-align:right; text-shadow:0 2px 8px #000; pointer-events:none; }
+  #speed { font-size:56px; font-weight:700; line-height:1; color:var(--accent); font-variant-numeric:tabular-nums; }
+  #speed small { font-size:18px; color:var(--fg); margin-left:6px; }
+  #engine { font-size:20px; font-variant-numeric:tabular-nums; margin-top:4px; }
+  #engine b { color:var(--accent); font-size:28px; margin-right:10px; }
+  #rpmbar { width:220px; height:6px; background:#0008; border-radius:3px; margin:6px 0 0 auto; overflow:hidden; }
+  #rpmfill { height:100%; width:0; background:var(--accent); }
+  #nitrobar { width:220px; height:8px; background:#0008; border-radius:4px; margin:8px 0 0 auto; overflow:hidden; }
+  #nitrofill { height:100%; width:100%; background:#3aa0ff; }
+  #nitrobar.on #nitrofill { background:#9fd4ff; box-shadow:0 0 10px #3aa0ff; }
+  #help { position:absolute; left:16px; bottom:16px; padding:10px 14px; background:var(--panel);
+    border:1px solid var(--line); border-radius:10px; color:var(--muted); font-size:12px; line-height:1.6; }
+  #help b { color:var(--fg); font-weight:600; }
+  #tuning { position:absolute; top:16px; right:16px; width:290px; padding:12px 14px; background:var(--panel);
+    border:1px solid var(--line); border-radius:10px; font-size:12px; }
+  #tuning[hidden] { display:none; }
+  #tuning label { display:grid; grid-template-columns: 1fr 90px 40px; gap:8px; align-items:center; margin:6px 0; color:var(--muted); }
+  #tuning output { color:var(--fg); text-align:right; font-variant-numeric:tabular-nums; }
+  #tuning button { margin-top:6px; background:#0f1114; color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:4px 10px; cursor:pointer; }
+  #msg { position:absolute; left:16px; top:16px; padding:8px 12px; background:var(--panel);
+    border:1px solid var(--line); border-radius:10px; font-size:12px; color:var(--muted); white-space:pre-line; }
+  #msg.err { color:#ff6b6b; }
+</style>
+</head>
+<body>
+<div id="msg">Cargando…</div>
+<div id="hud">
+  <div id="speed">0<small>km/h</small></div>
+  <div id="engine"><b id="gear">1</b><span id="rpm">1000</span> rpm</div>
+  <div id="rpmbar"><div id="rpmfill"></div></div>
+  <div id="nitrobar"><div id="nitrofill"></div></div>
+</div>
+<div id="tuning" hidden>
+  <b>Ajustes de conducción</b> <small>(T para ocultar)</small>
+  <label>Agarre <input type="range" data-k="grip" min="0.6" max="3" step="0.05"><output></output></label>
+  <label>Ángulo de deriva óptimo <input type="range" data-k="slipAngle" min="0.3" max="1.3" step="0.05"><output></output></label>
+  <label>Giro del volante <input type="range" data-k="steer" min="0.5" max="1.5" step="0.05"><output></output></label>
+  <label>Relajación del neumático <input type="range" data-k="relax" min="0.03" max="0.6" step="0.01"><output></output></label>
+  <label>Ayuda de estabilidad <input type="range" data-k="assist" min="0" max="2" step="0.05"><output></output></label>
+  <label>Influencia del suelo <input type="range" data-k="surface" min="0" max="1" step="0.05"><output></output></label>
+  <button id="tunereset">Restablecer</button>
+</div>
+<div id="help"><b>W/↑</b> acelerar · <b>S/↓</b> frenar/marcha atrás · <b>A D/← →</b> girar<br>
+  <b>Espacio</b> freno de mano · <b>Shift</b> nitro · <b>R</b> reponer coche · <b>C</b> cámara · <b>T</b> ajustes</div>
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+  "rapier": "https://cdn.jsdelivr.net/npm/@dimforge/rapier3d-compat@0.14.0/rapier.es.js"
+} }
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { DDSLoader } from 'three/addons/loaders/DDSLoader.js';
+import RAPIER from 'rapier';
+// carga siempre fresca mientras se desarrolla (el servidor estatico no manda cabeceras anti-cache)
+const { Vehicle } = await import(`./vehicle.js?t=${Date.now()}`);
+
+const params = new URLSearchParams(location.search);
+const CAR = parseInt(params.get('car')) || 1;
+const TRACK = params.get('track');                    // p.ej. "arena1"; sin parametro: suelo de pruebas
+const CARS_ROOT = '../extracted/data/cars';
+const SHADER = { WINDOW: 6, LIGHT: 10, SHADOW: 13 };
+const first = v => (Array.isArray(v) ? v[0] : v);
+
+const $ = id => document.getElementById(id);
+const msg = (t, err = false) => { $('msg').textContent = t; $('msg').className = err ? 'err' : ''; };
+
+// ================= render =================
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x8fb4d9);
+scene.fog = new THREE.Fog(0x8fb4d9, 80, 400);
+const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.1, 1000);
+scene.add(new THREE.HemisphereLight(0xdfeaff, 0x6a6558, 1.4));
+const sun = new THREE.DirectionalLight(0xfff2dd, 2.4);
+sun.position.set(60, 100, -40);
+scene.add(sun);
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+// ================= texturas / modelos (misma convención que index.html) =================
+const ddsLoader = new DDSLoader();
+const texCache = new Map();
+function loadTexture(dirs, file) {
+  const key = dirs.join('|') + file;
+  if (texCache.has(key)) return texCache.get(key);
+  const p = new Promise(resolve => {
+    const tryNext = i => {
+      if (i >= dirs.length) return resolve(null);
+      ddsLoader.load(dirs[i] + file, t => {
+        t.wrapS = t.wrapT = THREE.RepeatWrapping;
+        t.colorSpace = THREE.SRGBColorSpace;
+        resolve(t);
+      }, undefined, () => tryNext(i + 1));
+    };
+    tryNext(0);
+  });
+  texCache.set(key, p);
+  return p;
+}
+
+async function fetchModel(base) {
+  const [json, bin] = await Promise.all([
+    fetch(`${base}.json`).then(r => { if (!r.ok) throw new Error(`${base}.json: ${r.status}`); return r.json(); }),
+    fetch(`${base}.bin`).then(r => { if (!r.ok) throw new Error(`${base}.bin: ${r.status}`); return r.arrayBuffer(); }),
+  ]);
+  return { json, bin };
+}
+
+const attr = (bin, ref, Type, size) => new THREE.BufferAttribute(new Type(bin, ref.offset, ref.count), size);
+
+function makeMaterial(m, map) {
+  const mat = new THREE.MeshStandardMaterial({ map, roughness: 0.6, metalness: 0.1, color: map ? 0xffffff : 0x555555 });
+  if (m.shader === SHADER.WINDOW) Object.assign(mat, { transparent: true, opacity: 0.55, depthWrite: false, roughness: 0.1, metalness: 0.6 });
+  else if (m.shader === SHADER.LIGHT) Object.assign(mat, { transparent: true, depthWrite: false });
+  else if (m.alpha) Object.assign(mat, { transparent: true, alphaTest: 0.4, side: THREE.DoubleSide });
+  return mat;
+}
+
+function makeMesh(bin, p, material) {
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', attr(bin, p.position, Float32Array, 3));
+  if (p.normal) geo.setAttribute('normal', attr(bin, p.normal, Float32Array, 3)); else geo.computeVertexNormals();
+  if (p.uv) geo.setAttribute('uv', attr(bin, p.uv, Float32Array, 2));
+  geo.setIndex(new THREE.BufferAttribute(new Uint16Array(bin, p.index.offset, p.index.count), 1));
+  return new THREE.Mesh(geo, material);
+}
+
+async function buildCarPart(car, name) {
+  const { json, bin } = await fetchModel(`cars/car_${car}/${name}`);
+  const dirs = [`${CARS_ROOT}/car_${car}/`, `${CARS_ROOT}/shared/`];
+  const materials = await Promise.all(json.materials.map(async m =>
+    makeMaterial(m, m.texture ? await loadTexture(dirs, m.texture) : null)));
+  const group = new THREE.Group();
+  for (const node of json.nodes) {
+    if (!node.primitives.length) continue;
+    const obj = new THREE.Group();
+    obj.name = node.name;
+    obj.matrixAutoUpdate = false;
+    obj.matrix.fromArray(node.matrix);
+    for (const p of node.primitives) obj.add(makeMesh(bin, p, materials[p.material]));
+    group.add(obj);
+  }
+  group.userData.objects = json.objects;
+  return group;
+}
+
+// Caja de colision del body.ini (coordenadas del juego: z se invierte para three.js)
+async function loadCollisionBox(car) {
+  const txt = await fetch(`${CARS_ROOT}/car_${car}/body.ini`).then(r => r.text());
+  const vec = key => {
+    const m = txt.match(new RegExp(`${key}\\s*=\\s*\\{([^}]+)\\}`));
+    return m ? m[1].split(',').map(Number) : null;
+  };
+  const box = (a, b) => {
+    const min = vec(a), max = vec(b);
+    if (!min || !max) return null;
+    const zMin = -max[2], zMax = -min[2];
+    return { half: [(max[0] - min[0]) / 2, (max[1] - min[1]) / 2, (zMax - zMin) / 2],
+             center: [(max[0] + min[0]) / 2, (max[1] + min[1]) / 2, (zMax + zMin) / 2] };
+  };
+  const full = box('CollisionFullMin', 'CollisionFullMax') || { half: [0.9, 0.45, 1.85], center: [0, 0.62, 0] };
+  // el juego define una caja baja (carroceria) y una alta (cabina): juntas ajustan mejor que la caja completa
+  const parts = [box('CollisionBottomMin', 'CollisionBottomMax'), box('CollisionTopMin', 'CollisionTopMax')].filter(Boolean);
+  return { ...full, parts: parts.length === 2 ? parts : [full] };
+}
+
+// ================= mundo / física =================
+await RAPIER.init();
+const DT = 1 / 120;                                      // paso fijo de física
+const world = new RAPIER.World({ x: 0, y: -9.81, z: 0 });
+world.timestep = DT;
+
+let spawn = { position: new THREE.Vector3(0, 0.5, 0), yaw: 0 };
+let surfaceAt = null;        // (hit) => {dyn} dinamica de neumatico del suelo bajo la rueda; null = asfalto en todas partes
+let tireDyn = null;          // web/data/tire_dynamics.json (tools/export_surfaces.py)
+let props = null;            // props dinamicos de la pista (web/props.js), si existe tracks/<pista>/props.json
+let propTick = 0;
+const dynamicTrackMeshes = [];
+
+function addFlatTestGround() {
+  world.createCollider(RAPIER.ColliderDesc.cuboid(300, 0.5, 300).setTranslation(0, -0.5, 0).setFriction(1));
+  const ground = new THREE.Mesh(new THREE.PlaneGeometry(600, 600), new THREE.MeshStandardMaterial({ color: 0x59605a, roughness: 1 }));
+  ground.rotation.x = -Math.PI / 2;
+  scene.add(ground, new THREE.GridHelper(600, 300, 0x394038, 0x4a524a));
+  // un par de rampas para probar la suspensión
+  const ramp = (x, z, angle) => {
+    const q = new THREE.Quaternion().setFromEuler(new THREE.Euler(angle, 0, 0));
+    world.createCollider(RAPIER.ColliderDesc.cuboid(4, 0.25, 6).setTranslation(x, 0.6, z)
+      .setRotation({ x: q.x, y: q.y, z: q.z, w: q.w }).setFriction(1));
+    const m = new THREE.Mesh(new THREE.BoxGeometry(8, 0.5, 12), new THREE.MeshStandardMaterial({ color: 0xb08040 }));
+    m.position.set(x, 0.6, z); m.quaternion.copy(q);
+    scene.add(m);
+  };
+  ramp(14, -40, 0.22); ramp(-14, -70, 0.22);
+  // obstaculos de prueba lejos de la zona de salida: muro fino, bordillo, badenes y una pendiente larga
+  const block = (cx, cy, cz, hx, hy, hz, color = 0x884433) => {
+    world.createCollider(RAPIER.ColliderDesc.cuboid(hx, hy, hz).setTranslation(cx, cy, cz).setFriction(0.6).setRestitution(0.1));
+    const m = new THREE.Mesh(new THREE.BoxGeometry(hx * 2, hy * 2, hz * 2), new THREE.MeshStandardMaterial({ color }));
+    m.position.set(cx, cy, cz); scene.add(m);
+  };
+  block(0, 1.5, -150, 30, 1.5, 0.15);                  // muro fino a 150 m
+  block(150, 0.06, 150, 20, 0.06, 0.4, 0xaaaaaa);      // bordillo de 12 cm (x=150, z=150)
+  for (let i = 0; i < 6; i++) block(-150, 0.04, 120 - i * 6, 20, 0.04, 0.5, 0xb09030);   // badenes de 8 cm
+  const slope = new THREE.Quaternion().setFromEuler(new THREE.Euler(-0.18, 0, 0));        // subida de ~10°
+  world.createCollider(RAPIER.ColliderDesc.cuboid(10, 0.5, 40).setTranslation(-60, 6, 60)
+    .setRotation({ x: slope.x, y: slope.y, z: slope.z, w: slope.w }).setFriction(1));
+  const sm = new THREE.Mesh(new THREE.BoxGeometry(20, 1, 80), new THREE.MeshStandardMaterial({ color: 0x66707a }));
+  sm.position.set(-60, 6, 60); sm.quaternion.copy(slope); scene.add(sm);
+}
+
+async function addTrack(name) {
+  const { json, bin } = await fetchModel(`tracks/${name}/track`);
+  const dirs = (json.textureDirs || []);
+  const materials = await Promise.all(json.materials.map(async m =>
+    makeMaterial(m, m.texture ? await loadTexture(dirs, m.texture) : null)));
+  const group = new THREE.Group();
+  for (const p of json.primitives) {
+    const mesh = makeMesh(bin, p, materials[p.material]);
+    if (p.dynamic) dynamicTrackMeshes.push(mesh);   // props fusionados: se ocultan si se cargan como cuerpos rigidos
+    group.add(mesh);
+  }
+  scene.add(group);
+
+  const c = json.collision;
+  const pos = new Float32Array(bin.slice(c.position.offset, c.position.offset + c.position.count * 4));
+  // indices de colision: uint32 si el JSON lo indica (mallas con >65k vertices), si no uint16
+  const idx = c.indexType === 'uint32'
+    ? new Uint32Array(bin.slice(c.index.offset, c.index.offset + c.index.count * 4))
+    : Uint32Array.from(new Uint16Array(bin, c.index.offset, c.index.count));
+  const perMaterial = !!(c.triMaterial && c.materials);
+  if (!perMaterial) world.createCollider(RAPIER.ColliderDesc.trimesh(pos, idx).setFriction(1));
+
+  if (json.start && json.start.length) {
+    const s = json.start[0];
+    spawn = { position: new THREE.Vector3(...s.position), yaw: s.yaw || 0 };
+  }
+  // agarre por superficie: si la colision trae un material por triangulo (cdb2), el coche lo consulta
+  if (perMaterial) {
+    // Un colisionador por material de colision: cada uno con la friccion de carroceria de su superficie
+    // (BodyFriction de surfaces.bed), y asi la rueda identifica el suelo por el colisionador que golpea
+    // (hit.collider.handle -> dinamica de neumatico de game.db).
+    // Grupos: el chasis (membresia 1, filtro 5) ignora los colisionadores "solo para ruedas" (membresia 2,
+    // filtro 2): superficies sin colision de cuerpo, como el agua; los rayos de rueda si los ven.
+    const surfaces = await fetch('data/surfaces.json').then(r => r.json());
+    const triMat = new Uint8Array(bin, c.triMaterial.offset, c.triMaterial.count);
+    const byHandle = new Map();
+    for (const m of c.materials) {
+      const sf = surfaces[m.surface] || {};
+      if (sf.Name === 'NoCollision' || /^Camera only/i.test(sf.Name || '')) continue;   // ni cuerpo ni ruedas
+      const sub = [];
+      for (let t = 0; t < triMat.length; t++) if (triMat[t] === m.id) sub.push(idx[3 * t], idx[3 * t + 1], idx[3 * t + 2]);
+      if (!sub.length) continue;
+      const desc = RAPIER.ColliderDesc.trimesh(pos, Uint32Array.from(sub)).setFriction(sf.BodyFriction ?? 1).setRestitution(0.1);
+      if (sf.BodyCollision === false) desc.setCollisionGroups(0x00020002);
+      const col = world.createCollider(desc);
+      byHandle.set(col.handle, { dyn: tireDyn[sf.Dynamics] || tireDyn.Tarmac, surface: sf, material: m });
+    }
+    surfaceAt = hit => byHandle.get(hit.collider.handle) || null;
+  }
+  return json;
+}
+
+// ================= coche =================
+async function buildVehicle(car) {
+  const [body, tires, box, P] = await Promise.all([
+    buildCarPart(car, 'body'), buildCarPart(car, 'tire'), loadCollisionBox(car),
+    fetch(`cars/car_${car}/physics.json`).then(r => { if (!r.ok) throw new Error(`physics.json: ${r.status} (ejecuta tools/gamedb.py cars)`); return r.json(); }),
+  ]);
+  const visual = new THREE.Group();
+  visual.add(body, tires);
+  scene.add(visual);
+
+  // Los neumáticos están modelados en el origen; el body trae sus posiciones (solo traslación válida)
+  const radius = (() => {
+    const b = new THREE.Box3().setFromObject(tires.children.find(o => o.name === 'tire_fl'));
+    return (b.max.y - b.min.y) / 2 || 0.3;
+  })();
+  const anchors = {}, nodes = {};
+  for (const id of ['fl', 'fr', 'rl', 'rr']) {
+    nodes[id] = tires.children.find(o => o.name === `tire_${id}`);
+    const a = body.userData.objects.find(o => o.name === `placeholder_tire_${id}`);
+    anchors[id] = { x: a.matrix[12], y: a.matrix[13], z: a.matrix[14] };
+  }
+
+  // masa, centro de masa e inercia del juego. CenterOfMass (x, y, z+ adelante) se toma relativo
+  // al centro del plano de ejes; en three.js el frente es -z.
+  const mass = first(P.Mass), fudge = P.MassFudgeFactor || 1;
+  const axleY = (anchors.fl.y + anchors.fr.y + anchors.rl.y + anchors.rr.y) / 4;
+  const axleZ = (anchors.fl.z + anchors.fr.z + anchors.rl.z + anchors.rr.z) / 4;
+  const com = { x: P.CenterOfMass[0], y: axleY + P.CenterOfMass[1], z: axleZ - P.CenterOfMass[2] };
+
+  // CCD: a 150+ km/h el coche avanza mas de su grosor en un paso; sin esto atravesaria muros finos
+  const rb = world.createRigidBody(RAPIER.RigidBodyDesc.dynamic().setCanSleep(false)
+    .setLinearDamping(0).setAngularDamping(0.05).setCcdEnabled(true));
+  for (const part of box.parts) {
+    // grupos de colision: el coche es membresia 1 y choca con el mundo (1) y con los props (4)
+    world.createCollider(RAPIER.ColliderDesc.cuboid(...part.half).setTranslation(...part.center)
+      .setDensity(0).setFriction(0.35).setRestitution(0.12).setCollisionGroups(0x00010005), rb);
+  }
+  const [w, h, d] = box.half.map(v => v * 2);
+  rb.setAdditionalMassProperties(mass, com,
+    { x: fudge * mass / 12 * (h * h + d * d), y: fudge * mass / 12 * (w * w + d * d), z: fudge * mass / 12 * (w * w + h * h) },
+    { x: 0, y: 0, z: 0, w: 1 }, true);
+
+  const vehicle = new Vehicle(RAPIER, world, rb, P, anchors, radius, mass, com);
+  return { visual, body, tires, nodes, rb, vehicle, P, radius, box, mass };
+}
+
+// ================= control =================
+const keys = new Set();
+addEventListener('keydown', e => {
+  keys.add(e.code);
+  if (e.code === 'KeyR') resetCar();
+  if (e.code === 'KeyC') camMode = (camMode + 1) % 2;
+  if (e.code === 'KeyT') $('tuning').hidden = !$('tuning').hidden;
+  if (['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) e.preventDefault();
+});
+addEventListener('keyup', e => keys.delete(e.code));
+addEventListener('blur', () => keys.clear());
+const down = (...codes) => codes.some(c => keys.has(c));
+let camMode = 0;
+
+let V;   // vehículo
+
+function resetCar() {
+  if (!V) return;
+  const q = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), spawn.yaw);
+  V.rb.setTranslation({ x: spawn.position.x, y: spawn.position.y + 0.8, z: spawn.position.z }, true);
+  V.rb.setRotation({ x: q.x, y: q.y, z: q.z, w: q.w }, true);
+  V.rb.setLinvel({ x: 0, y: 0, z: 0 }, true);
+  V.rb.setAngvel({ x: 0, y: 0, z: 0 }, true);
+  V.vehicle.reset();
+}
+
+function readInput() {
+  return {
+    throttle: down('KeyW', 'ArrowUp') ? 1 : 0,
+    brake: down('KeyS', 'ArrowDown') ? 1 : 0,
+    steer: (down('KeyA', 'ArrowLeft') ? 1 : 0) - (down('KeyD', 'ArrowRight') ? 1 : 0),   // + = izquierda
+    handbrake: down('Space'),
+    nitro: down('ShiftLeft', 'ShiftRight', 'KeyN'),
+  };
+}
+
+function stepPhysics() {
+  V.vehicle.update(DT, readInput());
+  world.step();
+  if (props && ++propTick % 6 === 0) props.update(V.rb.translation());   // alta/baja de cuerpos y matrices de instancia (20 Hz)
+}
+
+// ================= sincronía visual =================
+function syncVisual() {
+  const t = V.rb.translation(), r = V.rb.rotation();
+  V.visual.position.set(t.x, t.y, t.z);
+  V.visual.quaternion.set(r.x, r.y, r.z, r.w);
+  V.visual.updateMatrixWorld(true);
+  const e = new THREE.Euler(), q = new THREE.Quaternion(), s = new THREE.Vector3(1, 1, 1);
+  for (const w of V.vehicle.wheels) {
+    // centro de la rueda: anclaje en reposo + recorrido de la suspensión
+    const local = new THREE.Vector3(w.anchor.x, w.anchor.y + w.rest - w.L, w.anchor.z);
+    e.set(-w.spin, w.steer, 0, 'YXZ');
+    V.nodes[w.id].matrix.compose(local, q.setFromEuler(e), s);
+  }
+}
+
+function updateCamera(dt) {
+  const t = V.rb.translation();
+  const q = V.visual.quaternion;
+  const back = new THREE.Vector3(0, 0, 1).applyQuaternion(q); back.y = 0; back.normalize();
+  const dist = camMode === 0 ? 6.5 : 3.2, height = camMode === 0 ? 2.4 : 1.3;
+  const want = new THREE.Vector3(t.x, t.y, t.z).addScaledVector(back, dist).add(new THREE.Vector3(0, height, 0));
+  camera.position.lerp(want, 1 - Math.exp(-dt * 6));
+  const look = new THREE.Vector3(t.x, t.y + 0.9, t.z).addScaledVector(back, -6);
+  camera.lookAt(look);
+}
+
+// ================= ajustes de conduccion (panel con T; se guardan en el navegador) =================
+function setupTuning(veh) {
+  const defaults = { ...veh.tune };
+  let saved = {};
+  // v2: al pasar a los datos reales de superficie cambiaron los valores de fabrica; los guardados antes ya no valen
+  try { saved = JSON.parse(localStorage.getItem('fo-tuning-v2') || '{}'); } catch { /* sin almacenamiento: se usan los valores por defecto */ }
+  Object.assign(veh.tune, saved);
+  const sliders = [...document.querySelectorAll('#tuning input[data-k]')];
+  const refresh = () => sliders.forEach(s => { s.value = veh.tune[s.dataset.k]; s.nextElementSibling.textContent = (+s.value).toFixed(2); });
+  const save = () => { try { localStorage.setItem('fo-tuning-v2', JSON.stringify(veh.tune)); } catch { /* ignorar */ } };
+  sliders.forEach(s => s.addEventListener('input', () => { veh.tune[s.dataset.k] = +s.value; refresh(); save(); }));
+  $('tunereset').onclick = () => { Object.assign(veh.tune, defaults); refresh(); save(); };
+  refresh();
+}
+
+// ================= arranque =================
+try {
+  msg('Cargando coche y pista…');
+  tireDyn = await fetch('data/tire_dynamics.json').then(r => { if (!r.ok) throw new Error('falta web/data/tire_dynamics.json (ejecuta tools/export_surfaces.py)'); return r.json(); });
+  if (TRACK) {
+    try { await addTrack(TRACK); }
+    catch (e) { console.warn(e); addFlatTestGround(); msg(`Pista "${TRACK}" no disponible (${e.message}); uso suelo de pruebas`, true); }
+  } else addFlatTestGround();
+  V = await buildVehicle(CAR);
+  V.vehicle.surfaceAt = surfaceAt;
+  V.vehicle.defaultDyn = tireDyn.Tarmac;
+  setupTuning(V.vehicle);
+  if (TRACK) {   // props dinamicos (vallas, barriles, neumaticos...): opcionales
+    try {
+      const { loadProps } = await import(`./props.js?t=${Date.now()}`);
+      props = await loadProps(RAPIER, world, scene, `tracks/${TRACK}/props.json`);
+      dynamicTrackMeshes.forEach(m => { m.visible = false; });
+      props.update(V.rb.translation());
+    } catch (e) { console.warn('sin props dinamicos:', e.message); props = null; }
+  }
+  resetCar();
+  camera.position.set(spawn.position.x, spawn.position.y + 3, spawn.position.z + 8);
+  const name = V.P.Name || `car_${CAR}`;
+  if (!$('msg').classList.contains('err')) msg(`${TRACK ? 'Pista ' + TRACK : 'Suelo de pruebas'} · ${name} · ${Math.round(V.mass)} kg`);
+  setTimeout(() => { if (!$('msg').classList.contains('err')) $('msg').style.display = 'none'; }, 4000);
+} catch (e) {
+  console.error(e);
+  msg(`Error: ${e.message}`, true);
+  throw e;
+}
+
+let last = performance.now(), acc = 0;
+renderer.setAnimationLoop(now => {
+  const frame = Math.min(0.1, (now - last) / 1000);
+  last = now;
+  acc += frame;
+  while (acc >= DT) { stepPhysics(); acc -= DT; }
+  syncVisual();
+  updateCamera(frame);
+  const veh = V.vehicle;
+  $('speed').firstChild.textContent = Math.round(veh.speedKmh);
+  $('gear').textContent = veh.gear < 0 ? 'R' : veh.gear;
+  $('rpm').textContent = Math.round(veh.rpm / 10) * 10;
+  $('rpmfill').style.width = `${Math.min(100, veh.rpm / veh.red * 100)}%`;
+  $('nitrofill').style.width = `${veh.nitroMax ? veh.nitro / veh.nitroMax * 100 : 0}%`;
+  $('nitrobar').classList.toggle('on', veh.nitroActive);
+  renderer.render(scene, camera);
+});
+
+// para depurar y probar desde la consola
+window.game = { THREE, scene, camera, world, DT, get V() { return V; }, get props() { return props; }, keys,
+  // avanza la física N segundos de golpe, sin depender de la tasa de fotogramas (para tests)
+  simulate(seconds) { for (let n = Math.round(seconds / DT); n > 0; n--) stepPhysics(); syncVisual(); },
+  state() {
+    const t = V.rb.translation(), v = V.rb.linvel(), veh = V.vehicle;
+    const fwd = new THREE.Vector3(0, 0, -1).applyQuaternion(V.visual.quaternion);
+    return { pos: [t.x, t.y, t.z].map(n => +n.toFixed(2)), speedKmh: +(Math.hypot(v.x, v.z) * 3.6).toFixed(1),
+      forwardSpeed: +(v.x * fwd.x + v.z * fwd.z).toFixed(2),
+      up: +new THREE.Vector3(0, 1, 0).applyQuaternion(V.visual.quaternion).y.toFixed(2),
+      gear: veh.gear, rpm: Math.round(veh.rpm),
+      contacts: veh.wheels.map(w => w.contact),
+      slip: veh.wheels.map(w => +w.slipRatio.toFixed(2)), load: veh.wheels.map(w => Math.round(w.Fz)) };
+  } };
+</script>
+</body>
+</html>

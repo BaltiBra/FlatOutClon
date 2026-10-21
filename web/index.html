@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FlatOut UC - Visor de coches</title>
+<style>
+  :root { --bg:#14161a; --panel:#1d2026e6; --fg:#e8eaed; --muted:#9aa0a6; --accent:#ff8a1f; --line:#2f333b; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--fg);
+    font:14px/1.4 system-ui, Segoe UI, sans-serif; overflow:hidden; }
+  canvas { display:block; }
+  #panel { position:absolute; top:16px; left:16px; width:260px; padding:14px; background:var(--panel);
+    border:1px solid var(--line); border-radius:10px; backdrop-filter: blur(6px); }
+  h1 { font-size:15px; margin:0 0 10px; color:var(--accent); letter-spacing:.3px; }
+  label { display:flex; align-items:center; justify-content:space-between; gap:10px; margin:8px 0; color:var(--muted); }
+  label.check { justify-content:flex-start; color:var(--fg); }
+  select, input[type=number] { background:#0f1114; color:var(--fg); border:1px solid var(--line);
+    border-radius:6px; padding:5px 8px; font:inherit; }
+  button { background:#0f1114; color:var(--fg); border:1px solid var(--line); border-radius:6px;
+    padding:5px 10px; cursor:pointer; font:inherit; }
+  button:hover { border-color:var(--accent); }
+  #status { margin-top:10px; font-size:12px; color:var(--muted); white-space:pre-line; min-height:2.8em; }
+  #status.err { color:#ff6b6b; }
+  @media (max-width: 600px) { #panel { width:calc(100% - 32px); } }
+</style>
+</head>
+<body>
+<div id="panel">
+  <h1>FlatOut Ultimate Carnage</h1>
+  <label>Coche
+    <span><button id="prev">◀</button> <select id="car"></select> <button id="next">▶</button></span>
+  </label>
+  <label>Skin <select id="skin"><option>1</option><option>2</option><option>3</option><option>4</option></select></label>
+  <label class="check"><input type="checkbox" id="wheels" checked>&nbsp;Ruedas</label>
+  <label class="check"><input type="checkbox" id="wire">&nbsp;Wireframe</label>
+  <label class="check"><input type="checkbox" id="spin" checked>&nbsp;Girar automáticamente</label>
+  <div id="status">Cargando…</div>
+</div>
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { DDSLoader } from 'three/addons/loaders/DDSLoader.js';
+
+const GAME_ROOT = '../extracted/data/cars';   // texturas originales (extraídas localmente)
+const NUM_CARS = 47;
+const SHADER = { WINDOW: 6, LIGHT: 10, SHADOW: 13 };
+
+const $ = id => document.getElementById(id);
+const status = (msg, err = false) => { $('status').textContent = msg; $('status').className = err ? 'err' : ''; };
+
+// ---------- escena ----------
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x14161a);
+scene.fog = new THREE.Fog(0x14161a, 12, 40);
+const camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 0.05, 100);
+camera.position.set(-4.2, 2.0, -5.2);   // el coche mira hacia -z: vista 3/4 trasera-izquierda
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 0.5, 0);
+controls.enableDamping = true;
+controls.maxPolarAngle = Math.PI * 0.495;
+
+scene.add(new THREE.HemisphereLight(0xcfd8ff, 0x303038, 1.1));
+const sun = new THREE.DirectionalLight(0xffffff, 2.2);
+sun.position.set(4, 8, -3);
+scene.add(sun);
+const fill = new THREE.DirectionalLight(0x88aaff, 0.6);
+fill.position.set(-5, 3, 5);
+scene.add(fill);
+
+const floor = new THREE.Mesh(new THREE.CircleGeometry(30, 64),
+  new THREE.MeshStandardMaterial({ color: 0x1b1e23, roughness: 0.95 }));
+floor.rotation.x = -Math.PI / 2;
+scene.add(floor, new THREE.GridHelper(30, 30, 0x3a3f48, 0x262a31));
+
+// ---------- texturas ----------
+const ddsLoader = new DDSLoader();
+const texCache = new Map();
+function loadTexture(car, file) {
+  const key = `${car}/${file}`;
+  if (texCache.has(key)) return texCache.get(key);
+  const p = new Promise(resolve => {
+    const apply = t => { t.wrapS = t.wrapT = THREE.RepeatWrapping; t.colorSpace = THREE.SRGBColorSpace; resolve(t); };
+    ddsLoader.load(`${GAME_ROOT}/car_${car}/${file}`, apply, undefined, () =>
+      ddsLoader.load(`${GAME_ROOT}/shared/${file}`, apply, undefined, () => resolve(null)));
+  });
+  texCache.set(key, p);
+  return p;
+}
+
+// ---------- carga del coche ----------
+let current = null;
+let loadToken = 0;
+
+async function fetchModel(car, name) {
+  const base = `cars/car_${car}/${name}`;
+  const [json, bin] = await Promise.all([
+    fetch(`${base}.json`).then(r => { if (!r.ok) throw new Error(`${base}.json: ${r.status}`); return r.json(); }),
+    fetch(`${base}.bin`).then(r => { if (!r.ok) throw new Error(`${base}.bin: ${r.status}`); return r.arrayBuffer(); }),
+  ]);
+  return { json, bin };
+}
+
+function attr(bin, ref, Type, itemSize, normalized = false) {
+  const arr = new Type(bin, ref.offset, ref.count);
+  return new THREE.BufferAttribute(arr, itemSize, normalized);
+}
+
+async function buildModel(car, name, skin) {
+  const { json, bin } = await fetchModel(car, name);
+  const group = new THREE.Group();
+  group.name = name;
+
+  const materials = await Promise.all(json.materials.map(async m => {
+    let file = m.texture;
+    if (file && /^skin\d+\.dds$/.test(file)) file = `skin${skin}.dds`;
+    const map = file ? await loadTexture(car, file) : null;
+    const mat = new THREE.MeshStandardMaterial({
+      map, roughness: 0.55, metalness: 0.15, side: THREE.FrontSide,
+      color: map ? 0xffffff : 0x222222,
+    });
+    mat.userData.baseTexture = m.texture;
+    if (m.shader === SHADER.WINDOW) {
+      Object.assign(mat, { transparent: true, opacity: 0.55, depthWrite: false, roughness: 0.1, metalness: 0.6 });
+    } else if (m.shader === SHADER.LIGHT) {
+      Object.assign(mat, { transparent: true, depthWrite: false });
+    } else if (m.alpha) {
+      Object.assign(mat, { transparent: true, alphaTest: 0.4, side: THREE.DoubleSide });
+    }
+    return mat;
+  }));
+
+  for (const node of json.nodes) {
+    if (!node.primitives.length) continue;
+    const obj = new THREE.Group();
+    obj.name = node.name;
+    obj.matrixAutoUpdate = false;
+    obj.matrix.fromArray(node.matrix);
+    for (const p of node.primitives) {
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', attr(bin, p.position, Float32Array, 3));
+      if (p.normal) geo.setAttribute('normal', attr(bin, p.normal, Float32Array, 3));
+      else geo.computeVertexNormals();
+      if (p.uv) geo.setAttribute('uv', attr(bin, p.uv, Float32Array, 2));
+      geo.setIndex(new THREE.BufferAttribute(new Uint16Array(bin, p.index.offset, p.index.count), 1));
+      geo.computeBoundingSphere();
+      const mesh = new THREE.Mesh(geo, materials[p.material]);
+      mesh.name = json.materials[p.material].name;
+      obj.add(mesh);
+    }
+    group.add(obj);
+  }
+  group.userData.objects = json.objects;
+  return group;
+}
+
+// Los neumaticos estan modelados en el origen; el cuerpo trae sus posiciones en los
+// objetos "placeholder_tire_fl/fr/rl/rr".
+function placeTires(body, tires) {
+  for (const obj of tires.children) {
+    const anchor = body.userData.objects.find(o => o.name === `placeholder_${obj.name}`);
+    // la base (rotacion/escala) de estos "dummies" viene a cero: solo vale la traslacion
+    if (anchor) obj.matrix.makeTranslation(anchor.matrix[12], anchor.matrix[13], anchor.matrix[14]);
+  }
+}
+
+async function loadCar(car) {
+  const token = ++loadToken;
+  status(`Cargando car_${car}…`);
+  try {
+    const skin = $('skin').value;
+    const [body, tires] = await Promise.all([buildModel(car, 'body', skin), buildModel(car, 'tire', skin)]);
+    if (token !== loadToken) return;               // el usuario cambió de coche mientras cargaba
+    if (current) { scene.remove(current.root); disposeGroup(current.root); }
+    placeTires(body, tires);
+    const root = new THREE.Group();
+    root.add(body, tires);
+    scene.add(root);
+    current = { root, car, tires };
+    applyOptions();
+    const box = new THREE.Box3().setFromObject(body);
+    const size = box.getSize(new THREE.Vector3());
+    status(`car_${car} · ${size.x.toFixed(2)} × ${size.y.toFixed(2)} × ${size.z.toFixed(2)} m\n${countTris(root)} triángulos`);
+    history.replaceState(null, '', `#${car}`);
+  } catch (e) {
+    console.error(e);
+    status(`Error al cargar car_${car}: ${e.message}`, true);
+  }
+}
+
+function countTris(root) {
+  let n = 0;
+  root.traverse(o => { if (o.isMesh) n += o.geometry.index.count / 3; });
+  return n.toLocaleString('es');
+}
+function disposeGroup(g) {
+  g.traverse(o => { if (o.isMesh) o.geometry.dispose(); });
+}
+
+function applyOptions() {
+  if (!current) return;
+  current.tires.visible = $('wheels').checked;
+  const wire = $('wire').checked;
+  current.root.traverse(o => { if (o.isMesh) o.material.wireframe = wire; });
+}
+
+// ---------- UI ----------
+for (let i = 1; i <= NUM_CARS; i++) $('car').add(new Option(`car_${i}`, i));
+const startCar = Math.min(NUM_CARS, Math.max(1, parseInt(location.hash.slice(1)) || 1));
+$('car').value = startCar;
+const go = n => { $('car').value = ((n - 1 + NUM_CARS) % NUM_CARS) + 1; loadCar(+$('car').value); };
+$('car').onchange = () => loadCar(+$('car').value);
+$('prev').onclick = () => go(+$('car').value - 1);
+$('next').onclick = () => go(+$('car').value + 1);
+$('skin').onchange = () => loadCar(+$('car').value);
+$('wheels').onchange = $('wire').onchange = applyOptions;
+addEventListener('keydown', e => {
+  if (e.target.tagName === 'SELECT') return;
+  if (e.key === 'ArrowLeft') go(+$('car').value - 1);
+  if (e.key === 'ArrowRight') go(+$('car').value + 1);
+});
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+renderer.setAnimationLoop(() => {
+  if ($('spin').checked && current) current.root.rotation.y += 0.004;
+  controls.update();
+  renderer.render(scene, camera);
+});
+
+window.viewer = { THREE, scene, camera, controls, get current() { return current; } };  // para depurar desde la consola
+loadCar(startCar);
+</script>
+</body>
+</html>

@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="es"><head><meta charset="utf-8"><title>Track test</title>
+<style>html,body{margin:0;height:100%;background:#222;color:#ddd;font:12px monospace}
+#info{position:fixed;left:6px;top:6px;background:#0008;padding:4px 6px;white-space:pre}</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script></head><body><div id="info">cargando...</div>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { DDSLoader } from 'three/addons/loaders/DDSLoader.js';
+
+const Q = new URLSearchParams(location.search);
+const BASE = 'tracks/arena1/';
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x8fb4d8);
+const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.5, 3000);
+camera.position.set(0, 250, 300);
+const controls = new OrbitControls(camera, renderer.domElement);
+scene.add(new THREE.HemisphereLight(0xffffff, 0x777766, 1.6));
+const sun = new THREE.DirectionalLight(0xffffff, 1.2); sun.position.set(1, 2, 1); scene.add(sun);
+
+const [json, bin] = await Promise.all([
+  fetch(BASE + 'track.json').then(r => r.json()),
+  fetch(BASE + 'track.bin').then(r => r.arrayBuffer())]);
+const f32 = o => new Float32Array(bin, o.offset, o.count);
+const dds = new DDSLoader();
+const texCache = new Map();
+function loadTex(file) {
+  if (!file) return Promise.resolve(null);
+  if (texCache.has(file)) return texCache.get(file);
+  const dirs = json.textureDirs;
+  const p = new Promise(resolve => {
+    const tryDir = i => {
+      if (i >= dirs.length) return resolve(null);
+      dds.load(dirs[i] + file, t => { t.wrapS = t.wrapT = THREE.RepeatWrapping; t.needsUpdate = true; resolve(t); },
+        undefined, () => tryDir(i + 1));
+    };
+    tryDir(0);
+  });
+  texCache.set(file, p);
+  return p;
+}
+const mats = await Promise.all(json.materials.map(async m => {
+  const map = await loadTex(m.texture);
+  const mat = new THREE.MeshLambertMaterial({ map: map || null, color: map ? 0xffffff : 0xff00ff });
+  if (m.alpha) { mat.alphaTest = 0.4; mat.transparent = false; mat.side = THREE.DoubleSide; }
+  return mat;
+}));
+const track = new THREE.Group(); scene.add(track);
+let missing = json.materials.filter((m, i) => m.texture && !mats[i].map).map(m => m.texture);
+for (const p of json.primitives) {
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(f32(p.position), 3));
+  if (p.normal) g.setAttribute('normal', new THREE.BufferAttribute(f32(p.normal), 3));
+  if (p.uv) g.setAttribute('uv', new THREE.BufferAttribute(f32(p.uv), 2));
+  g.setIndex(new THREE.BufferAttribute(new Uint16Array(bin, p.index.offset, p.index.count), 1));
+  track.add(new THREE.Mesh(g, mats[p.material]));
+}
+// collision (wireframe) y start points
+const cg = new THREE.BufferGeometry();
+cg.setAttribute('position', new THREE.BufferAttribute(f32(json.collision.position), 3));
+cg.setIndex(new THREE.BufferAttribute(new Uint32Array(bin, json.collision.index.offset, json.collision.index.count), 1));
+const col = new THREE.Mesh(cg, new THREE.MeshBasicMaterial({ color: 0x00ff00, wireframe: true }));
+col.visible = Q.get('col') === '1'; scene.add(col);
+const sph = new THREE.SphereGeometry(1, 12, 8);
+json.start.forEach((s, i) => {
+  const m = new THREE.Mesh(sph, new THREE.MeshBasicMaterial({ color: i ? 0xff0000 : 0xffff00 }));
+  m.position.set(...s.position); scene.add(m);
+  const dir = new THREE.ArrowHelper(new THREE.Vector3(Math.sin(-s.yaw), 0, -Math.cos(s.yaw)), m.position, 6, 0x00ffff);
+  scene.add(dir);
+});
+window.__t = { THREE, scene, camera, controls, col, track, json, renderer };
+const cam = (Q.get('cam') || '').split(',').map(Number);
+if (cam.length === 6) { camera.position.set(cam[0], cam[1], cam[2]); controls.target.set(cam[3], cam[4], cam[5]); }
+else { const s = json.start[0].position; controls.target.set(0, 0, 0); }
+controls.update();
+document.getElementById('info').textContent =
+  `${json.primitives.length} prims, colision ${json.collision.index.count / 3} tris\nsin textura: ${missing.join(' ') || 'ninguna'}`;
+renderer.setAnimationLoop(() => renderer.render(scene, camera));
+addEventListener('resize', () => { renderer.setSize(innerWidth, innerHeight); camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); });
+</script></body></html>
